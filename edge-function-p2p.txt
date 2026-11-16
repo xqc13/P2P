@@ -1,0 +1,823 @@
+// Supabase Edge Function "p2p" — версия 4
+// Проверяет подпись Telegram, хранит данные в закрытых таблицах pp_*,
+// ведёт круги (ордера покупки/продажи), процент трейдера, карты с лимитами,
+// считает доли и рассылает уведомления и месячные отчёты через бота.
+// Нужен секрет TELEGRAM_BOT_TOKEN. Verify JWT у функции выключить.
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "content-type, authorization, apikey, x-client-info",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const enc = new TextEncoder();
+
+async function hmac(key, msg) {
+  const k = await crypto.subtle.importKey(
+    "raw",
+    typeof key === "string" ? enc.encode(key) : key,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
+}
+
+const hex = (u8) => [...u8].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+function timingEq(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+
+export async function verifyInitData(initData, token, nowMs, maxAgeSec = 259200) {
+  if (!initData || !token || typeof initData !== "string") return null;
+  const p = new URLSearchParams(initData);
+  const hash = p.get("hash");
+  if (!hash) return null;
+  p.delete("hash");
+  const dcs = [...p.entries()].map(([k, v]) => k + "=" + v).sort().join("\n");
+  const secret = await hmac("WebAppData", token);
+  const calc = hex(await hmac(secret, dcs));
+  if (!timingEq(calc, hash)) return null;
+  const ad = Number(p.get("auth_date"));
+  if (!ad || nowMs / 1000 - ad > maxAgeSec) return null;
+  try {
+    const u = JSON.parse(p.get("user") || "null");
+    return u && u.id ? u : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- константы и форматирование ----------
+const ROOM_RE = /^[A-Za-z0-9_-]{6,40}$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MONTH_RE = /^\d{4}-\d{2}$/;
+const EPS = 0.005; // рубли
+const DUST = 0.5; // USDT: остаток, который можно не продавать при закрытии круга
+const TZ_MS = 5 * 3600e3; // Екатеринбург
+const MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
+const fail = (status, error) => ({ status, body: { ok: false, error } });
+const num = (v) => (typeof v === "number" ? v : parseFloat(String(v ?? "").replace(/\s/g, "").replace(",", ".")));
+const pos = (v) => Number.isFinite(v) && v > 0 && v < 1e12;
+const nf = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const nf0 = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 });
+const sign = (v) => (v > 0 ? "+" : "") + nf.format(v);
+const todayOf = (now) => new Date(now + TZ_MS).toISOString().slice(0, 10);
+const optDate = (v) => (DATE_RE.test(String(v || "")) ? String(v) : null);
+const fee01 = (v) => {
+  const f = v === "" || v == null ? 0 : num(v);
+  return Number.isFinite(f) && f >= 0 && f < 50 ? f : null;
+};
+
+function genCode() {
+  const a = "abcdefghjkmnpqrstuvwxyz23456789";
+  const r = new Uint8Array(10);
+  crypto.getRandomValues(r);
+  return [...r].map((x) => a[x % a.length]).join("");
+}
+
+// ---------- расчёты ----------
+export function calcDeal(amount, buy, sell, fee) {
+  const out = (amount / buy) * sell * (1 - fee / 100);
+  const profit = out - amount;
+  return { profit, spread: (profit / amount) * 100 };
+}
+
+export function circleStats(c, orders) {
+  let rubIn = 0, usdtIn = 0, rubOut = 0, usdtOut = 0, n = 0, last = null;
+  for (const o of orders) {
+    if (o.circle_id !== c.id) continue;
+    n++;
+    if (o.side === "buy") { rubIn += o.rub; usdtIn += o.usdt; } else { rubOut += o.rub; usdtOut += o.usdt; }
+    if (o.date && (!last || o.date > last)) last = o.date;
+  }
+  return { rubIn, usdtIn, rubOut, usdtOut, rem: usdtIn - usdtOut, n, last };
+}
+
+// Прибыль круга: сначала процент трейдеру (только с плюса), остальное — по долям на старте круга
+export function allocate(profit, shares, traderId, pct) {
+  const cut = profit > 0 && traderId && pct > 0 ? (profit * pct) / 100 : 0;
+  const alloc = {};
+  for (const id in shares) alloc[id] = (profit - cut) * shares[id];
+  if (cut) alloc[traderId] = (alloc[traderId] || 0) + cut;
+  return { alloc, cut };
+}
+
+export function balances(partners, moves, deals, circles) {
+  const b = {};
+  partners.forEach((p) => (b[p.id] = 0));
+  moves.forEach((m) => {
+    if (b[m.partner_id] !== undefined) b[m.partner_id] += m.kind === "deposit" ? m.amount : -m.amount;
+  });
+  deals.forEach((d) => {
+    const s = d.shares || {};
+    for (const id in s) if (b[id] !== undefined) b[id] += d.profit * s[id];
+  });
+  (circles || []).forEach((c) => {
+    if (c.status !== "closed") return;
+    const a = c.alloc || {};
+    for (const id in a) if (b[id] !== undefined) b[id] += a[id];
+  });
+  return b;
+}
+
+// Деньги, которые сейчас крутятся в открытых кругах
+export function inWork(circles, orders) {
+  let s = 0;
+  circles.forEach((c) => {
+    if (c.status !== "open") return;
+    const st = circleStats(c, orders);
+    s += st.rubIn - st.rubOut;
+  });
+  return s;
+}
+
+function negatives(partners, moves, deals, circles) {
+  const b = balances(partners, moves, deals, circles);
+  return partners.filter((p) => b[p.id] < -EPS).map((p) => p.name);
+}
+
+export function cardUsage(card, orders, day) {
+  const month = day.slice(0, 7);
+  let dIn = 0, dOut = 0, dOps = 0, mIn = 0, mOut = 0, mOps = 0;
+  for (const o of orders) {
+    if (o.card_id !== card.id || !o.date) continue;
+    const incoming = o.side === "sell"; // при продаже USDT рубли приходят на карту
+    if (o.date.slice(0, 7) === month) { mOps++; if (incoming) mIn += o.rub; else mOut += o.rub; }
+    if (o.date === day) { dOps++; if (incoming) dIn += o.rub; else dOut += o.rub; }
+  }
+  return { dIn, dOut, dOps, day: dIn + dOut, mIn, mOut, mOps, month: mIn + mOut };
+}
+
+function limitLevel(used, limit) {
+  if (!(limit > 0)) return 0;
+  const r = used / limit;
+  return r >= 1 ? 2 : r >= 0.8 ? 1 : 0;
+}
+
+export function buildReport(o) {
+  const { title, month, partners, moves, deals, circles, orders, settings } = o;
+  const inM = (d) => d && String(d).slice(0, 7) === month;
+  const closed = circles.filter((c) => c.status === "closed" && inM(c.closed));
+  const ds = deals.filter((d) => inM(d.date));
+  const mv = moves.filter((m) => inM(m.date));
+  if (!closed.length && !ds.length && !mv.length) return null;
+  let profit = 0, turn = 0, cut = 0;
+  const earn = {}, dep = {}, wd = {};
+  partners.forEach((p) => { earn[p.id] = 0; dep[p.id] = 0; wd[p.id] = 0; });
+  closed.forEach((c) => {
+    profit += c.profit || 0;
+    turn += circleStats(c, orders).rubIn;
+    cut += c.cut || 0;
+    const a = c.alloc || {};
+    for (const id in a) if (earn[id] !== undefined) earn[id] += a[id];
+  });
+  ds.forEach((d) => {
+    profit += d.profit;
+    turn += d.amount;
+    const s = d.shares || {};
+    for (const id in s) if (earn[id] !== undefined) earn[id] += d.profit * s[id];
+  });
+  mv.forEach((m) => {
+    if (dep[m.partner_id] === undefined) return;
+    if (m.kind === "deposit") dep[m.partner_id] += m.amount; else wd[m.partner_id] += m.amount;
+  });
+  const bal = balances(partners, moves, deals, circles);
+  const [y, mm] = month.split("-");
+  const lines = [];
+  lines.push("📊 Отчёт за " + MONTHS[Number(mm) - 1] + " " + y + (title ? " — «" + title + "»" : ""));
+  lines.push("");
+  lines.push("Кругов: " + (closed.length + ds.length) + ", оборот " + nf0.format(turn) + " ₽");
+  lines.push("Прибыль: " + sign(profit) + " ₽" + (turn > 0 ? " (спред " + sign((profit / turn) * 100) + " %)" : ""));
+  if (cut > 0) {
+    const tr = partners.find((p) => p.id === (settings && settings.trader_id));
+    lines.push("Трейдеру" + (tr ? " (" + tr.name + ")" : "") + ": " + sign(cut) + " ₽");
+  }
+  if (partners.length) {
+    lines.push("");
+    lines.push("Участники:");
+    partners.forEach((p) => {
+      let s = "• " + p.name + ": " + sign(earn[p.id]) + " ₽, баланс " + nf.format(bal[p.id]) + " ₽";
+      const extra = [];
+      if (dep[p.id] > 0) extra.push("внёс " + nf0.format(dep[p.id]));
+      if (wd[p.id] > 0) extra.push("вывел " + nf0.format(wd[p.id]));
+      if (extra.length) s += " (" + extra.join(", ") + ")";
+      lines.push(s);
+    });
+  }
+  return lines.join("\n");
+}
+
+function prevMonth(now) {
+  const d = new Date(now + TZ_MS);
+  const first = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+  return new Date(first - 864e5).toISOString().slice(0, 7);
+}
+
+async function loadRoom(db, room) {
+  const [partners, moves, deals, circles, orders, cards, settingsRows, members, groups] = await Promise.all([
+    db.list("pp_partners", room),
+    db.list("pp_moves", room),
+    db.list("pp_deals", room),
+    db.list("pp_circles", room),
+    db.list("pp_orders", room),
+    db.list("pp_cards", room),
+    db.list("pp_settings", room),
+    db.list("pp_members", room),
+    room.startsWith("u-") ? Promise.resolve([]) : db.list("pp_groups", room),
+  ]);
+  return { partners, moves, deals, circles, orders, cards, settings: settingsRows[0] || null, members, group: groups[0] || null };
+}
+
+// Ежемесячные отчёты: вызывается по расписанию. Каждый отчёт уходит максимум один раз.
+export async function cronMonthly(deps) {
+  const { db, send } = deps;
+  const now = deps.now ? deps.now() : Date.now();
+  const month = prevMonth(now);
+  const rooms = [...new Set((await db.listAll("pp_members")).map((m) => m.room))];
+  let sent = 0;
+  for (const room of rooms) {
+    try {
+      await db.insert("pp_reports", { room, month, ts: now });
+    } catch {
+      continue; // уже отправлен
+    }
+    const R = await loadRoom(db, room);
+    const text = buildReport({
+      title: room.startsWith("u-") ? "Личный кабинет" : (R.group && R.group.name) || room,
+      month, ...R,
+    });
+    if (!text) continue;
+    const targets = R.members.filter((m) => m.notify !== false);
+    const res = await Promise.allSettled(targets.map((m) => send(m.tg_id, text)));
+    sent += res.filter((r) => r.status === "fulfilled").length;
+  }
+  return { status: 200, body: { ok: true, month, sent } };
+}
+
+// ---------- обработчик ----------
+export async function handle(body, deps) {
+  const { db, token, send } = deps;
+  const now = deps.now ? deps.now() : Date.now();
+  body = body || {};
+  if (body.action === "cron_monthly") return cronMonthly(deps);
+
+  const user = await verifyInitData(body.initData, token, now);
+  if (!user) return fail(401, "Сессия Telegram недействительна. Закройте и снова откройте приложение.");
+
+  const uname = [user.first_name, user.last_name].filter(Boolean).join(" ") || user.username || "Участник";
+  const action = body.action;
+  const today = todayOf(now);
+
+  const myGroups = async () => {
+    const mem = await db.listBy("pp_members", "tg_id", user.id);
+    const rooms = [...new Set(mem.map((m) => m.room).filter((r) => !String(r).startsWith("u-")))];
+    if (!rooms.length) return [];
+    const gs = await db.listIn("pp_groups", "room", rooms);
+    return rooms
+      .map((r) => {
+        const g = gs.find((x) => x.room === r);
+        const m = mem.find((x) => x.room === r) || {};
+        return { code: r, name: (g && g.name) || r, ts: m.ts || 0 };
+      })
+      .sort((a, b) => a.ts - b.ts)
+      .map(({ code, name }) => ({ code, name }));
+  };
+
+  if (action === "my_groups") return { status: 200, body: { ok: true, groups: await myGroups() } };
+
+  let room = String(body.room || "");
+  let created = false;
+  if (action === "create_group") {
+    const gname = String(body.name || "").trim().slice(0, 40);
+    if (!gname) return fail(400, "Введите название группы.");
+    const already = (await db.listBy("pp_members", "tg_id", user.id)).filter((m) => !String(m.room).startsWith("u-"));
+    if (already.length >= 20) return fail(400, "Вы уже состоите в 20 группах.");
+    let code = "";
+    for (let i = 0; i < 5 && !code; i++) {
+      const c = genCode();
+      if (!(await db.list("pp_groups", c)).length && !(await db.list("pp_members", c)).length) code = c;
+    }
+    if (!code) return fail(500, "Не удалось создать группу, попробуйте ещё раз.");
+    await db.insert("pp_groups", { room: code, name: gname, owner_tg: user.id, ts: now });
+    room = code;
+    created = true;
+  }
+  const personal = room.startsWith("u-");
+  if (personal) {
+    if (room !== "u-" + user.id) return fail(403, "Нет доступа к этому кабинету.");
+  } else if (!ROOM_RE.test(room)) {
+    return fail(400, "Код группы: от 6 до 40 символов, латиница, цифры, «-» и «_».");
+  }
+
+  let group = personal ? null : (await db.list("pp_groups", room))[0] || null;
+  let members = await db.list("pp_members", room);
+  if (!personal && !group && members.length === 0) {
+    return fail(404, "Группа с таким кодом не найдена. Проверьте код или создайте новую группу.");
+  }
+  let mine = members.find((m) => Number(m.tg_id) === Number(user.id));
+  let joined = false;
+  if (!mine) {
+    if (members.length >= 20) return fail(403, "В группе уже 20 участников.");
+    if (!personal && !created) {
+      const already = (await db.listBy("pp_members", "tg_id", user.id)).filter((m) => !String(m.room).startsWith("u-"));
+      if (already.length >= 20) return fail(400, "Вы уже состоите в 20 группах.");
+    }
+    mine = await db.insert("pp_members", { room, tg_id: user.id, name: uname, notify: true, ts: now });
+    members.push(mine);
+    joined = !personal && !created;
+  } else if (mine.name !== uname) {
+    await db.update("pp_members", mine.id, room, { name: uname });
+    mine.name = uname;
+  }
+
+  let partners, moves, deals, circles, orders, cards, settings;
+  const reload = async () => {
+    const R = await loadRoom(db, room);
+    ({ partners, moves, deals, circles, orders, cards, settings, members } = R);
+    if (R.group) group = R.group;
+  };
+  await reload();
+
+  let warn = "";
+  const done = async () => ({
+    status: 200,
+    body: {
+      ok: true,
+      warn: warn || undefined,
+      data: {
+        room,
+        today,
+        group: personal ? null : { code: room, name: (group && group.name) || room },
+        groups: await myGroups(),
+        partners: partners.map((p) => ({ id: p.id, name: p.name, ts: p.ts })),
+        moves: moves.map((m) => ({ id: m.id, partner_id: m.partner_id, kind: m.kind, amount: m.amount, date: m.date, ts: m.ts })),
+        deals: deals.map((d) => ({
+          id: d.id, date: d.date, amount: d.amount, buy: d.buy, sell: d.sell, fee: d.fee,
+          profit: d.profit, spread: d.spread, shares: d.shares || {}, ts: d.ts,
+        })),
+        circles: circles.map((c) => ({
+          id: c.id, status: c.status, opened: c.opened, closed: c.closed, shares: c.shares || {},
+          trader_id: c.trader_id || null, trader_pct: c.trader_pct || 0,
+          profit: c.profit || 0, cut: c.cut || 0, alloc: c.alloc || {}, ts: c.ts,
+        })),
+        orders: orders.map((o) => ({
+          id: o.id, circle_id: o.circle_id, side: o.side, rub: o.rub, usdt: o.usdt, rate: o.rate,
+          fee: o.fee, card_id: o.card_id || null, date: o.date, ts: o.ts,
+        })),
+        cards: cards.map((c) => ({ id: c.id, name: c.name, day_limit: c.day_limit || 0, month_limit: c.month_limit || 0, ts: c.ts })),
+        settings: { trader_id: (settings && settings.trader_id) || null, trader_pct: (settings && settings.trader_pct) || 0 },
+        members: members.map((m) => ({ name: m.name, me: Number(m.tg_id) === Number(user.id), notify: m.notify !== false })),
+      },
+    },
+  });
+
+  const pname = (id) => (partners.find((p) => p.id === id) || {}).name || "—";
+  const title = () => (personal ? "Личный кабинет" : (group && group.name) || room);
+  const notify = async (text) => {
+    if (personal || !send) return;
+    const targets = members.filter((m) => Number(m.tg_id) !== Number(user.id) && m.notify !== false);
+    await Promise.allSettled(targets.map((m) => send(m.tg_id, "«" + title() + "»\n" + text)));
+  };
+  const allocText = (alloc) =>
+    Object.keys(alloc || {})
+      .map((id) => "• " + pname(id) + " " + sign(alloc[id]) + " ₽")
+      .join("\n");
+  const freeCash = () => {
+    const b = balances(partners, moves, deals, circles);
+    return Object.values(b).reduce((s, x) => s + x, 0) - inWork(circles, orders);
+  };
+  const snapshotShares = () => {
+    const bal = balances(partners, moves, deals, circles);
+    const pp = partners.filter((p) => bal[p.id] > EPS);
+    const total = pp.reduce((s, p) => s + bal[p.id], 0);
+    if (!(total > 0)) return null;
+    const shares = {};
+    pp.forEach((p) => (shares[p.id] = bal[p.id] / total));
+    return shares;
+  };
+  const traderNow = () => {
+    const id = settings && settings.trader_id;
+    const pct = (settings && settings.trader_pct) || 0;
+    return id && partners.some((p) => p.id === id) && pct > 0 ? { id, pct } : { id: null, pct: 0 };
+  };
+  const checkCard = (cardId, date) => {
+    if (!cardId) return "";
+    const c = cards.find((x) => x.id === cardId);
+    if (!c) return "";
+    const u = cardUsage(c, orders, date);
+    const msgs = [];
+    const dl = limitLevel(u.day, c.day_limit), ml = limitLevel(u.month, c.month_limit);
+    if (dl === 2) msgs.push("дневной лимит превышен: " + nf0.format(u.day) + " из " + nf0.format(c.day_limit) + " ₽");
+    else if (dl === 1) msgs.push("дневной лимит почти исчерпан: " + nf0.format(u.day) + " из " + nf0.format(c.day_limit) + " ₽");
+    if (ml === 2) msgs.push("месячный лимит превышен: " + nf0.format(u.month) + " из " + nf0.format(c.month_limit) + " ₽");
+    else if (ml === 1) msgs.push("месячный лимит почти исчерпан: " + nf0.format(u.month) + " из " + nf0.format(c.month_limit) + " ₽");
+    return msgs.length ? "Карта «" + c.name + "»: " + msgs.join("; ") + "." : "";
+  };
+  const cardLevels = (cardId, date) => {
+    const c = cards.find((x) => x.id === cardId);
+    if (!c) return [0, 0];
+    const u = cardUsage(c, orders, date);
+    return [limitLevel(u.day, c.day_limit), limitLevel(u.month, c.month_limit)];
+  };
+  const validCard = (v) => (v && cards.some((c) => c.id === v) ? v : null);
+  const closeText = (c, st) =>
+    "✅ Круг закрыт (" + uname + ")\nВложено " + nf.format(st.rubIn) + " ₽, получено " + nf.format(st.rubOut) + " ₽\nПрибыль " +
+    sign(c.profit) + " ₽" + (st.rubIn > 0 ? ", спред " + sign((c.profit / st.rubIn) * 100) + " %" : "") +
+    (c.cut > 0 ? "\nТрейдеру " + pname(c.trader_id) + ": " + sign(c.cut) + " ₽" : "") +
+    "\n" + allocText(c.alloc);
+
+  if (joined) await notify("👋 К группе присоединился " + uname);
+
+  switch (action) {
+    case "list":
+    case "create_group":
+      return done();
+
+    // ---------- группы ----------
+    case "rename_group": {
+      if (personal) return fail(400, "Личный кабинет нельзя переименовать.");
+      const gname = String(body.name || "").trim().slice(0, 40);
+      if (!gname) return fail(400, "Введите название группы.");
+      if (group) await db.update("pp_groups", group.id, room, { name: gname });
+      else await db.insert("pp_groups", { room, name: gname, owner_tg: user.id, ts: now });
+      await reload();
+      await notify("✏️ " + uname + " переименовал группу: " + gname);
+      return done();
+    }
+
+    case "leave_group": {
+      if (personal) return fail(400, "Личный кабинет нельзя покинуть.");
+      await db.remove("pp_members", mine.id, room);
+      members = members.filter((m) => m.id !== mine.id);
+      await notify("🚪 " + uname + " покинул группу");
+      return { status: 200, body: { ok: true, groups: await myGroups() } };
+    }
+
+    case "set_notify": {
+      await db.update("pp_members", mine.id, room, { notify: !!body.on });
+      await reload();
+      return done();
+    }
+
+    // ---------- участники и деньги ----------
+    case "add_partner": {
+      const name = String(body.name || "").trim().slice(0, 40);
+      if (!name) return fail(400, "Введите имя участника.");
+      if (partners.length >= 30) return fail(400, "Слишком много участников (максимум 30).");
+      const hasDep = body.deposit !== "" && body.deposit != null && num(body.deposit) !== 0;
+      const dep = hasDep ? num(body.deposit) : 0;
+      if (hasDep && !pos(dep)) return fail(400, "Вклад должен быть числом больше нуля.");
+      const p = await db.insert("pp_partners", { room, name, ts: now });
+      if (dep > 0) await db.insert("pp_moves", { room, partner_id: p.id, kind: "deposit", amount: dep, date: optDate(body.date) || today, ts: now });
+      await reload();
+      await notify("👤 Новый участник: " + name + (dep > 0 ? "\nВклад " + nf.format(dep) + " ₽" : ""));
+      return done();
+    }
+
+    case "del_partner": {
+      const p = partners.find((x) => x.id === body.id);
+      if (!p) return fail(404, "Участник не найден.");
+      if (moves.some((m) => m.partner_id === p.id)) return fail(400, "У участника есть движения средств. Сначала выведите баланс или удалите записи.");
+      const bal = balances(partners, moves, deals, circles)[p.id] || 0;
+      if (Math.abs(bal) > EPS) return fail(400, "У участника есть баланс " + nf.format(bal) + " ₽. Сначала выведите его.");
+      if (circles.some((c) => c.status === "open" && (c.shares || {})[p.id])) return fail(400, "Участник участвует в открытом круге.");
+      await db.remove("pp_partners", p.id, room);
+      if (settings && settings.trader_id === p.id) await db.update("pp_settings", settings.id, room, { trader_id: null });
+      await reload();
+      return done();
+    }
+
+    case "add_move": {
+      const p = partners.find((x) => x.id === body.partner_id);
+      if (!p) return fail(404, "Участник не найден.");
+      const kind = body.kind === "withdraw" ? "withdraw" : body.kind === "deposit" ? "deposit" : null;
+      if (!kind) return fail(400, "Выберите пополнение или вывод.");
+      const amount = num(body.amount);
+      if (!pos(amount)) return fail(400, "Сумма должна быть числом больше нуля.");
+      if (moves.length >= 5000) return fail(400, "Слишком много записей.");
+      if (kind === "withdraw") {
+        const bal = balances(partners, moves, deals, circles)[p.id] || 0;
+        if (amount > bal + EPS) return fail(400, "Нельзя вывести больше баланса: у участника " + nf.format(bal) + " ₽.");
+        const free = freeCash();
+        if (amount > free + EPS) return fail(400, "Сейчас свободно только " + nf.format(free) + " ₽ — остальное в открытых кругах.");
+      }
+      await db.insert("pp_moves", { room, partner_id: p.id, kind, amount, date: optDate(body.date) || today, ts: now });
+      await reload();
+      await notify((kind === "deposit" ? "➕ Пополнение: " : "➖ Вывод: ") + p.name + " " + nf.format(amount) + " ₽");
+      return done();
+    }
+
+    case "del_move": {
+      const m = moves.find((x) => x.id === body.id);
+      if (!m) return fail(404, "Запись не найдена.");
+      const bad = negatives(partners, moves.filter((x) => x.id !== m.id), deals, circles);
+      if (bad.length) return fail(400, "Нельзя удалить: баланс станет отрицательным (" + bad.join(", ") + ").");
+      if (m.kind === "deposit" && m.amount > freeCash() + EPS) return fail(400, "Нельзя удалить: эти деньги сейчас в открытом круге.");
+      await db.remove("pp_moves", m.id, room);
+      await reload();
+      await notify("🗑 Удалена запись: " + (m.kind === "deposit" ? "пополнение " : "вывод ") + pname(m.partner_id) + " " + nf.format(m.amount) + " ₽");
+      return done();
+    }
+
+    // ---------- процент трейдера ----------
+    case "set_trader": {
+      const id = body.trader_id ? String(body.trader_id) : null;
+      if (id && !partners.some((p) => p.id === id)) return fail(404, "Участник не найден.");
+      const pct = id ? num(body.pct) : 0;
+      if (id && !(Number.isFinite(pct) && pct >= 0 && pct <= 90)) return fail(400, "Процент трейдера — от 0 до 90.");
+      const row = { trader_id: id, trader_pct: id ? pct : 0 };
+      if (settings) await db.update("pp_settings", settings.id, room, row);
+      else await db.insert("pp_settings", { room, ...row, ts: now });
+      await reload();
+      await notify(id ? "⚙️ Трейдер: " + pname(id) + ", " + nf.format(pct) + " % от прибыли (для новых кругов)" : "⚙️ Процент трейдера отключён (для новых кругов)");
+      return done();
+    }
+
+    // ---------- карты ----------
+    case "add_card":
+    case "upd_card": {
+      const name = String(body.name || "").trim().slice(0, 40);
+      if (!name) return fail(400, "Введите название карты.");
+      const dl = body.day_limit === "" || body.day_limit == null ? 0 : num(body.day_limit);
+      const ml = body.month_limit === "" || body.month_limit == null ? 0 : num(body.month_limit);
+      if (!(Number.isFinite(dl) && dl >= 0 && dl < 1e12) || !(Number.isFinite(ml) && ml >= 0 && ml < 1e12)) return fail(400, "Лимиты — числа от нуля.");
+      if (action === "add_card") {
+        if (cards.length >= 40) return fail(400, "Слишком много карт (максимум 40).");
+        await db.insert("pp_cards", { room, name, day_limit: dl, month_limit: ml, ts: now });
+      } else {
+        const c = cards.find((x) => x.id === body.id);
+        if (!c) return fail(404, "Карта не найдена.");
+        await db.update("pp_cards", c.id, room, { name, day_limit: dl, month_limit: ml });
+      }
+      await reload();
+      return done();
+    }
+
+    case "del_card": {
+      const c = cards.find((x) => x.id === body.id);
+      if (!c) return fail(404, "Карта не найдена.");
+      await db.remove("pp_cards", c.id, room);
+      await reload();
+      return done();
+    }
+
+    // ---------- круги ----------
+    case "open_circle": {
+      if (circles.length >= 5000) return fail(400, "Слишком много кругов.");
+      if (circles.filter((c) => c.status === "open").length >= 10) return fail(400, "Открыто уже 10 кругов — закройте старые.");
+      const shares = snapshotShares();
+      if (!shares) return fail(400, "Сначала добавьте участников с вкладами.");
+      const t = traderNow();
+      await db.insert("pp_circles", {
+        room, status: "open", opened: optDate(body.date) || today, closed: null, shares,
+        trader_id: t.id, trader_pct: t.pct, profit: 0, cut: 0, alloc: {}, ts: now,
+      });
+      await reload();
+      return done();
+    }
+
+    case "add_order": {
+      const c = circles.find((x) => x.id === body.circle_id);
+      if (!c) return fail(404, "Круг не найден.");
+      if (c.status !== "open") return fail(400, "Круг уже закрыт. Откройте его снова, чтобы добавить ордер.");
+      if (orders.length >= 20000) return fail(400, "Слишком много ордеров.");
+      const side = body.side === "sell" ? "sell" : body.side === "buy" ? "buy" : null;
+      if (!side) return fail(400, "Выберите покупку или продажу.");
+      const amount = num(body.amount), rate = num(body.rate), fee = fee01(body.fee);
+      if (!pos(amount) || !pos(rate)) return fail(400, "Введите сумму и курс больше нуля.");
+      if (fee === null) return fail(400, "Комиссия должна быть от 0 до 50 %.");
+      const date = optDate(body.date) || today;
+      const card_id = validCard(body.card_id);
+      const st = circleStats(c, orders);
+      let rub, usdt;
+      if (side === "buy") {
+        rub = amount;
+        usdt = (amount / rate) * (1 - fee / 100);
+        const free = freeCash();
+        if (rub > free + EPS) return fail(400, "В банке свободно только " + nf.format(Math.max(free, 0)) + " ₽.");
+      } else {
+        usdt = amount;
+        if (usdt > st.rem + 1e-6) return fail(400, "В круге осталось только " + nf.format(st.rem) + " USDT.");
+        rub = usdt * rate * (1 - fee / 100);
+      }
+      const before = card_id ? cardLevels(card_id, date) : [0, 0];
+      await db.insert("pp_orders", { room, circle_id: c.id, side, rub, usdt, rate, fee, card_id, date, ts: now });
+      await reload();
+      if (card_id) {
+        const after = cardLevels(card_id, date);
+        warn = checkCard(card_id, date);
+        if (after[0] > before[0] || after[1] > before[1]) await notify("⚠️ " + warn);
+      }
+      return done();
+    }
+
+    case "del_order": {
+      const o = orders.find((x) => x.id === body.id);
+      if (!o) return fail(404, "Ордер не найден.");
+      const c = circles.find((x) => x.id === o.circle_id);
+      if (!c || c.status !== "open") return fail(400, "Ордер в закрытом круге. Сначала откройте круг снова.");
+      if (o.side === "buy") {
+        const st = circleStats(c, orders.filter((x) => x.id !== o.id));
+        if (st.rem < -1e-6) return fail(400, "Сначала удалите продажи: без этой покупки остаток станет отрицательным.");
+      }
+      await db.remove("pp_orders", o.id, room);
+      await reload();
+      return done();
+    }
+
+    case "close_circle": {
+      const c = circles.find((x) => x.id === body.id);
+      if (!c) return fail(404, "Круг не найден.");
+      if (c.status !== "open") return fail(400, "Круг уже закрыт.");
+      const st = circleStats(c, orders);
+      if (!st.n) return fail(400, "В круге нет ордеров.");
+      if (st.rem > DUST) return fail(400, "Сначала продайте остаток: " + nf.format(st.rem) + " USDT.");
+      const profit = st.rubOut - st.rubIn;
+      const { alloc, cut } = allocate(profit, c.shares || {}, c.trader_id, c.trader_pct);
+      const patch = { status: "closed", closed: st.last || today, profit, cut, alloc };
+      const bad = negatives(partners, moves, deals, circles.map((x) => (x.id === c.id ? { ...x, ...patch } : x)));
+      if (bad.length) return fail(400, "Нельзя закрыть: баланс станет отрицательным (" + bad.join(", ") + ").");
+      await db.update("pp_circles", c.id, room, patch);
+      await reload();
+      await notify(closeText({ ...c, ...patch }, st));
+      return done();
+    }
+
+    case "reopen_circle": {
+      const c = circles.find((x) => x.id === body.id);
+      if (!c) return fail(404, "Круг не найден.");
+      if (c.status !== "closed") return fail(400, "Круг и так открыт.");
+      const patch = { status: "open", closed: null, profit: 0, cut: 0, alloc: {} };
+      const next = circles.map((x) => (x.id === c.id ? { ...x, ...patch } : x));
+      const bad = negatives(partners, moves, deals, next);
+      if (bad.length) return fail(400, "Нельзя открыть: баланс станет отрицательным (" + bad.join(", ") + ").");
+      await db.update("pp_circles", c.id, room, patch);
+      await reload();
+      await notify("↩️ " + uname + " открыл круг заново для правки (прибыль " + sign(c.profit || 0) + " ₽ временно снята)");
+      return done();
+    }
+
+    case "del_circle": {
+      const c = circles.find((x) => x.id === body.id);
+      if (!c) return fail(404, "Круг не найден.");
+      if (c.status === "closed") {
+        const bad = negatives(partners, moves, deals, circles.filter((x) => x.id !== c.id));
+        if (bad.length) return fail(400, "Нельзя удалить: баланс станет отрицательным (" + bad.join(", ") + ").");
+      }
+      const own = orders.filter((o) => o.circle_id === c.id);
+      for (const o of own) await db.remove("pp_orders", o.id, room);
+      await db.remove("pp_circles", c.id, room);
+      await reload();
+      if (c.status === "closed") await notify("🗑 Круг удалён (" + uname + "), прибыль " + sign(c.profit || 0) + " ₽ снята");
+      return done();
+    }
+
+    // Быстрый круг из калькулятора: одна покупка и одна продажа, сразу закрыт
+    case "quick_circle": {
+      const amount = num(body.amount), buy = num(body.buy), sell = num(body.sell), fee = fee01(body.fee);
+      if (!pos(amount) || !pos(buy) || !pos(sell)) return fail(400, "Заполните сумму и оба курса числами больше нуля.");
+      if (fee === null) return fail(400, "Комиссия должна быть от 0 до 50 %.");
+      if (circles.length >= 5000) return fail(400, "Слишком много кругов.");
+      const shares = snapshotShares();
+      if (!shares) return fail(400, "Сначала добавьте участников с вкладами.");
+      const free = freeCash();
+      if (amount > free + EPS) return fail(400, "В банке свободно только " + nf.format(Math.max(free, 0)) + " ₽.");
+      const date = optDate(body.date) || today;
+      const cb = validCard(body.card_buy), cs = validCard(body.card_sell);
+      const usdt = amount / buy;
+      const rubOut = usdt * sell * (1 - fee / 100);
+      const profit = rubOut - amount;
+      const t = traderNow();
+      const { alloc, cut } = allocate(profit, shares, t.id, t.pct);
+      const lv = (id) => (id ? cardLevels(id, date) : [0, 0]);
+      const b1 = lv(cb), b2 = lv(cs);
+      const c = await db.insert("pp_circles", {
+        room, status: "closed", opened: date, closed: date, shares, trader_id: t.id, trader_pct: t.pct,
+        profit, cut, alloc, ts: now,
+      });
+      await db.insert("pp_orders", { room, circle_id: c.id, side: "buy", rub: amount, usdt, rate: buy, fee: 0, card_id: cb, date, ts: now });
+      await db.insert("pp_orders", { room, circle_id: c.id, side: "sell", rub: rubOut, usdt, rate: sell, fee, card_id: cs, date, ts: now + 1 });
+      await reload();
+      const warns = [];
+      for (const [id, b] of [[cb, b1], [cs, b2]]) {
+        if (!id || (id === cs && id === cb && warns.length)) continue;
+        const a = lv(id), w = checkCard(id, date);
+        if (w) warns.push(w);
+        if (w && (a[0] > b[0] || a[1] > b[1])) await notify("⚠️ " + w);
+      }
+      warn = warns.join(" ");
+      const cc = circles.find((x) => x.id === c.id) || c;
+      await notify(closeText(cc, circleStats(cc, orders)));
+      return done();
+    }
+
+    // ---------- старые сделки (до кругов) ----------
+    case "del_deal": {
+      const d = deals.find((x) => x.id === body.id);
+      if (!d) return fail(404, "Сделка не найдена.");
+      const bad = negatives(partners, moves, deals.filter((x) => x.id !== d.id), circles);
+      if (bad.length) return fail(400, "Нельзя удалить: баланс станет отрицательным (" + bad.join(", ") + ").");
+      await db.remove("pp_deals", d.id, room);
+      await reload();
+      await notify("🗑 Сделка удалена (" + uname + "): прибыль " + sign(d.profit) + " ₽");
+      return done();
+    }
+
+    // ---------- отчёт ----------
+    case "send_report": {
+      const month = MONTH_RE.test(String(body.month || "")) ? String(body.month) : today.slice(0, 7);
+      const text = buildReport({ title: title(), month, partners, moves, deals, circles, orders, settings });
+      if (!text) return fail(400, "За этот месяц нет данных для отчёта.");
+      if (!send) return fail(500, "Отправка недоступна.");
+      const targets = personal ? members : members.filter((m) => m.notify !== false || Number(m.tg_id) === Number(user.id));
+      const res = await Promise.allSettled(targets.map((m) => send(m.tg_id, text)));
+      const okN = res.filter((r) => r.status === "fulfilled" && r.value !== false).length;
+      warn = okN ? "" : "Бот не смог отправить отчёт. Откройте чат с ботом и нажмите «Старт».";
+      const r = await done();
+      r.body.sent = okN;
+      return r;
+    }
+
+    default:
+      return fail(400, "Неизвестное действие.");
+  }
+}
+
+// ---------- запуск в Supabase ----------
+function makeDb(sb) {
+  const chk = (error) => { if (error) throw new Error(error.message); };
+  return {
+    async list(t, room) {
+      const { data, error } = await sb.from(t).select("*").eq("room", room).order("ts", { ascending: true });
+      chk(error);
+      return data || [];
+    },
+    async listBy(t, field, value) {
+      const { data, error } = await sb.from(t).select("*").eq(field, value).order("ts", { ascending: true });
+      chk(error);
+      return data || [];
+    },
+    async listIn(t, field, values) {
+      const { data, error } = await sb.from(t).select("*").in(field, values);
+      chk(error);
+      return data || [];
+    },
+    async listAll(t) {
+      const { data, error } = await sb.from(t).select("room");
+      chk(error);
+      return data || [];
+    },
+    async insert(t, row) {
+      const { data, error } = await sb.from(t).insert(row).select().single();
+      chk(error);
+      return data;
+    },
+    async update(t, id, room, patch) {
+      const { error } = await sb.from(t).update(patch).eq("id", id).eq("room", room);
+      chk(error);
+    },
+    async remove(t, id, room) {
+      const { error } = await sb.from(t).delete().eq("id", id).eq("room", room);
+      chk(error);
+    },
+  };
+}
+
+async function tgSend(token, chatId, text) {
+  const r = await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+  if (!r.ok) throw new Error("telegram " + r.status);
+  return true;
+}
+
+// @ts-ignore
+if (typeof Deno !== "undefined" && Deno.serve) {
+  // @ts-ignore
+  const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2");
+  // @ts-ignore
+  const token = Deno.env.get("TELEGRAM_BOT_TOKEN");
+  // @ts-ignore
+  const sb = createClient(Deno.env.get("SUPABASE_URL"), Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false } });
+  const db = makeDb(sb);
+  // @ts-ignore
+  Deno.serve(async (req) => {
+    if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
+    const json = (status, obj) => new Response(JSON.stringify(obj), { status, headers: { ...CORS, "Content-Type": "application/json" } });
+    if (!token) return json(500, { ok: false, error: "На сервере не задан TELEGRAM_BOT_TOKEN." });
+    try {
+      const body = JSON.parse(await req.text());
+      const r = await handle(body, { db, token, send: (id, text) => tgSend(token, id, text) });
+      return json(r.status, r.body);
+    } catch (e) {
+      return json(500, { ok: false, error: "Ошибка сервера: " + String((e && e.message) || e).slice(0, 200) });
+    }
+  });
+}
