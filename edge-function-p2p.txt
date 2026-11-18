@@ -1,4 +1,4 @@
-// Supabase Edge Function "p2p" — версия 4
+// Supabase Edge Function "p2p" — версия 5 (бот отвечает на /start)
 // Проверяет подпись Telegram, хранит данные в закрытых таблицах pp_*,
 // ведёт круги (ордера покупки/продажи), процент трейдера, карты с лимитами,
 // считает доли и рассылает уведомления и месячные отчёты через бота.
@@ -788,6 +788,53 @@ function makeDb(sb) {
   };
 }
 
+// ---------- бот: ответы на команды ----------
+export const APP_URL = "https://xqc13.github.io/P2P/"; // адрес кабинета на GitHub Pages
+
+export function botReply(msg, appUrl = APP_URL) {
+  if (!msg || !msg.chat || msg.chat.type !== "private" || typeof msg.text !== "string") return null;
+  const t = msg.text.trim();
+  const name = (msg.from && msg.from.first_name) || "";
+  const kb = { inline_keyboard: [[{ text: "📊 Открыть кабинет", web_app: { url: appUrl } }]] };
+  let text;
+  if (/^\/start(\s|@|$)/.test(t)) {
+    text = "Привет" + (name ? ", " + name : "") + "! 👋\n\n" +
+      "Это P2P-кабинет: круги и спред, общий банк, доли участников, лимиты карт и отчёты.\n\n" +
+      "Нажмите кнопку ниже, чтобы открыть кабинет. Уведомления о сделках и месячные отчёты будут приходить в этот чат.";
+  } else if (/^\/help(\s|@|$)/.test(t)) {
+    text = "Как пользоваться:\n" +
+      "• «Счета» — личный кабинет и общие группы. Создайте группу и пригласите партнёров кодом.\n" +
+      "• «Круги» — добавляйте покупки и продажи USDT, закрывайте круг, прибыль делится по долям.\n" +
+      "• «Карты и лимиты» — следите за оборотом карт.\n" +
+      "• «Аналитика» — прибыль за период и отчёт в Telegram.";
+  } else {
+    text = "Откройте кабинет кнопкой ниже. Команды: /start, /help";
+  }
+  return { method: "sendMessage", chat_id: msg.chat.id, text, reply_markup: kb };
+}
+
+async function tgApi(token, method, payload) {
+  const r = await fetch("https://api.telegram.org/bot" + token + "/" + method, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  return r.json().catch(() => ({ ok: false }));
+}
+
+// Один раз после запуска функции подключаем бота к ней (webhook) и задаём список команд
+async function ensureWebhook(token, selfUrl, secret) {
+  const info = await tgApi(token, "getWebhookInfo");
+  if (info && info.ok && info.result && info.result.url === selfUrl) return;
+  await tgApi(token, "setWebhook", { url: selfUrl, secret_token: secret, allowed_updates: ["message"] });
+  await tgApi(token, "setMyCommands", {
+    commands: [
+      { command: "start", description: "Открыть P2P-кабинет" },
+      { command: "help", description: "Как пользоваться" },
+    ],
+  });
+}
+
 async function tgSend(token, chatId, text) {
   const r = await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
     method: "POST",
@@ -807,6 +854,9 @@ if (typeof Deno !== "undefined" && Deno.serve) {
   // @ts-ignore
   const sb = createClient(Deno.env.get("SUPABASE_URL"), Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false } });
   const db = makeDb(sb);
+  // секрет для webhook выводится из токена, отдельно настраивать ничего не нужно
+  const hookSecret = token ? hex(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode("p2p-webhook:" + token)))).slice(0, 48) : "";
+  let hookChecked = false;
   // @ts-ignore
   Deno.serve(async (req) => {
     if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
@@ -814,6 +864,19 @@ if (typeof Deno !== "undefined" && Deno.serve) {
     if (!token) return json(500, { ok: false, error: "На сервере не задан TELEGRAM_BOT_TOKEN." });
     try {
       const body = JSON.parse(await req.text());
+      // сообщение боту от Telegram
+      if (body && body.update_id !== undefined) {
+        if (req.headers.get("x-telegram-bot-api-secret-token") !== hookSecret) return new Response("forbidden", { status: 403 });
+        const reply = botReply(body.message);
+        return reply ? new Response(JSON.stringify(reply), { headers: { "Content-Type": "application/json" } }) : new Response("ok");
+      }
+      if (!hookChecked && body && body.initData) {
+        hookChecked = true;
+        const slug = new URL(req.url).pathname.split("/").filter(Boolean).pop() || "clever-function";
+        // @ts-ignore
+        const selfUrl = Deno.env.get("SUPABASE_URL") + "/functions/v1/" + slug;
+        try { await ensureWebhook(token, selfUrl, hookSecret); } catch { hookChecked = false; }
+      }
       const r = await handle(body, { db, token, send: (id, text) => tgSend(token, id, text) });
       return json(r.status, r.body);
     } catch (e) {
