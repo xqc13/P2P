@@ -1,4 +1,4 @@
-// Supabase Edge Function "p2p" — версия 5 (бот отвечает на /start)
+// Supabase Edge Function "p2p" — версия 6 (бот отвечает на /start, ссылка ?setup=1)
 // Проверяет подпись Telegram, хранит данные в закрытых таблицах pp_*,
 // ведёт круги (ордера покупки/продажи), процент трейдера, карты с лимитами,
 // считает доли и рассылает уведомления и месячные отчёты через бота.
@@ -823,10 +823,11 @@ async function tgApi(token, method, payload) {
 }
 
 // Один раз после запуска функции подключаем бота к ней (webhook) и задаём список команд
-async function ensureWebhook(token, selfUrl, secret) {
+async function ensureWebhook(token, selfUrl, secret, force = false) {
   const info = await tgApi(token, "getWebhookInfo");
-  if (info && info.ok && info.result && info.result.url === selfUrl) return;
-  await tgApi(token, "setWebhook", { url: selfUrl, secret_token: secret, allowed_updates: ["message"] });
+  if (!force && info && info.ok && info.result && info.result.url === selfUrl) return info;
+  const set = await tgApi(token, "setWebhook", { url: selfUrl, secret_token: secret, allowed_updates: ["message"] });
+  if (!set || !set.ok) throw new Error("Telegram не принял webhook: " + ((set && set.description) || "нет ответа") + ". Проверьте TELEGRAM_BOT_TOKEN.");
   await tgApi(token, "setMyCommands", {
     commands: [
       { command: "start", description: "Открыть P2P-кабинет" },
@@ -862,6 +863,30 @@ if (typeof Deno !== "undefined" && Deno.serve) {
     if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
     const json = (status, obj) => new Response(JSON.stringify(obj), { status, headers: { ...CORS, "Content-Type": "application/json" } });
     if (!token) return json(500, { ok: false, error: "На сервере не задан TELEGRAM_BOT_TOKEN." });
+    const slug = new URL(req.url).pathname.split("/").filter(Boolean).pop() || "clever-function";
+    // @ts-ignore
+    const selfUrl = Deno.env.get("SUPABASE_URL") + "/functions/v1/" + slug;
+    // Открыли адрес функции в браузере: проверка и подключение бота
+    if (req.method === "GET") {
+      const page = (obj) => new Response(JSON.stringify(obj, null, 2), { headers: { ...CORS, "Content-Type": "application/json; charset=utf-8" } });
+      if (new URL(req.url).searchParams.get("setup") !== "1") {
+        return page({ ok: true, message: "Функция работает, токен бота задан. Чтобы подключить бота, добавьте к адресу ?setup=1", version: 6 });
+      }
+      try {
+        await ensureWebhook(token, selfUrl, hookSecret, true);
+        const me = await tgApi(token, "getMe");
+        const info = await tgApi(token, "getWebhookInfo");
+        hookChecked = true;
+        return page({
+          ok: true,
+          message: "Бот @" + ((me.result && me.result.username) || "?") + " подключён. Напишите ему /start.",
+          webhook: info.result && info.result.url,
+          last_error: (info.result && info.result.last_error_message) || null,
+        });
+      } catch (e) {
+        return page({ ok: false, error: String((e && e.message) || e) });
+      }
+    }
     try {
       const body = JSON.parse(await req.text());
       // сообщение боту от Telegram
@@ -872,9 +897,6 @@ if (typeof Deno !== "undefined" && Deno.serve) {
       }
       if (!hookChecked && body && body.initData) {
         hookChecked = true;
-        const slug = new URL(req.url).pathname.split("/").filter(Boolean).pop() || "clever-function";
-        // @ts-ignore
-        const selfUrl = Deno.env.get("SUPABASE_URL") + "/functions/v1/" + slug;
         try { await ensureWebhook(token, selfUrl, hookSecret); } catch { hookChecked = false; }
       }
       const r = await handle(body, { db, token, send: (id, text) => tgSend(token, id, text) });
